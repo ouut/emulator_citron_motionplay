@@ -6,9 +6,13 @@ on:
   workflow_dispatch:
 
 jobs:
+  # ============================================================================
+  # macOS
+  # ============================================================================
   build-macos:
+    name: "Citron Build (macOS)"
     runs-on: macos-latest
-    timeout-minutes: 240
+    timeout-minutes: 180
 
     steps:
       - name: Checkout
@@ -16,123 +20,237 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Install dependencies
+      - name: Install System Dependencies via Homebrew
         run: |
-          brew install \
-            ninja cmake pkg-config \
-            boost catch2 enet fmt \
-            lz4 zstd openssl@3 libusb opus \
-            nlohmann-json sdl2 openal-soft \
-            molten-vk vulkan-headers vulkan-loader \
-            glslang hidapi libvpx lld llvm nasm \
-            python@3.12 ffmpeg@7 webp
+          brew install ninja boost catch2 cmake enet fmt ffmpeg glslang hidapi libvpx lld llvm nasm nlohmann-json openal-soft sdl2 molten-vk vulkan-headers vulkan-loader webp lz4 zstd openssl@3 pkg-config libusb opus python@3.12
 
-      - name: Patch Qt AGL
+      - name: Get Version
+        id: version
         run: |
-          FILE="externals/qt/qtbase/cmake/FindWrapOpenGL.cmake"
-          if [ -f "$FILE" ]; then
-            echo "Patching AGL framework path..."
-            # Replace the AGL framework line with empty path
-            sed -i '' '40,46s/.*__opengl_agl_fw_path.*/    set(__opengl_agl_fw_path "")/' "$FILE"
-            echo "Patched successfully"
-            grep -n "agl" "$FILE" || echo "No AGL references after patch"
-          else
-            echo "AGL patch file not found at $FILE, checking location..."
-            find externals -name "FindWrapOpenGL.cmake" 2>/dev/null || echo "File not in externals"
-          fi
+          git fetch --tags
+          VERSION=$(git rev-parse --short HEAD)
+          echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
 
-      - name: Set up Python
+      - name: Set up Python 3.12 venv
         run: |
           python3.12 -m venv venv
           source venv/bin/activate
           pip install jsonschema jinja2
+          echo "VIRTUAL_ENV=$PWD/venv" >> $GITHUB_ENV
+          echo "$PWD/venv/bin" >> $GITHUB_PATH
 
       - name: Configure CMake
         run: |
-          cmake -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
+          OPENAL_DIR="$(brew --prefix openal-soft)"
+          SDL2_DIR="$(brew --prefix sdl2)"
+          cmake -B build -S . -G "Ninja" \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
-            -DENABLE_QT=ON \
-            -DENABLE_SDL2=ON \
-            -DCITRON_USE_EXTERNAL_SDL2=OFF \
-            -DENABLE_WEB_SERVICE=OFF \
-            -DCITRON_ENABLE_LTO=OFF \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+            -DCMAKE_PREFIX_PATH="$OPENAL_DIR;$SDL2_DIR" \
+            -DCITRON_BUILD_TYPE=Nightly \
+            -DCITRON_USE_FASTER_LD=OFF \
             -DCITRON_USE_BUNDLED_VCPKG=OFF \
-            -DCITRON_USE_BUNDLED_FFMPEG=OFF \
-            -DUSE_DISCORD_PRESENCE=OFF \
+            -DENABLE_QT=ON \
+            -DCITRON_ENABLE_LTO=ON \
             -DCITRON_TESTS=OFF \
-            -DENABLE_OPENSSL=ON
+            -DUSE_DISCORD_PRESENCE=ON \
+            -DENABLE_WEB_SERVICE=ON \
+            -DENABLE_OPENSSL=ON \
+            -DENABLE_SDL2=ON \
+            -DCITRON_USE_EXTERNAL_SDL2=OFF
 
-      - name: Build
-        run: cmake --build build --config Release
-
-      - name: Package
+      - name: Patch AGL in Qt
         run: |
           set -e
-          APP=$(find build -name "citron.app" -type d 2>/dev/null | head -1)
-          if [ -z "$APP" ]; then
-            echo "ERROR: citron.app not found!"
-            find build -name "citron*" -type f 2>/dev/null | head -20
-            find build -name "*.app" 2>/dev/null | head -10
-            exit 1
-          fi
+          # Qt bundled by cmake configure into build/externals
+          # Fix AGL framework path for newer macOS SDKs
+          FILES=$(find build/externals -path "*/macos/lib/cmake/Qt6/FindWrapOpenGL.cmake" 2>/dev/null)
+          for f in $FILES; do
+            if grep -q "__opengl_agl_fw_path" "$f" 2>/dev/null; then
+              echo "Patching AGL in: $f"
+              awk 'NR>=40 && NR<=46 {if(NR==40) print "          set(__opengl_agl_fw_path \"\")"; next}1' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+            fi
+          done
 
+      - name: Build Citron
+        run: cmake --build build --config Release
+
+      - name: Package macOS Build
+        run: |
+          set -e
           mkdir -p dist
-          cp -r "$APP" dist/
-          APP="dist/citron.app"
-
-          # macdeployqt
-          QTDIR=$(brew --prefix qt@6 2>/dev/null || echo /usr/local/opt/qt@6)
-          if [ -f "$QTDIR/bin/macdeployqt" ]; then
-            echo "Running macdeployqt..."
-            $QTDIR/bin/macdeployqt "$APP" -verbose=1 || true
+          APP_BUNDLE_PATH=$(find build -name "citron.app" | head -n 1)
+          if [ -z "$APP_BUNDLE_PATH" ]; then
+            echo "::error::Could not find citron.app bundle after build!"; exit 1
           fi
-
-          # MoltenVK ICD
-          MOLTENVK_DIR=$(brew --prefix molten-vk 2>/dev/null || echo /usr/local/opt/molten-vk)
-          mkdir -p "$APP/Contents/Frameworks"
-          if [ -f "$MOLTENVK_DIR/lib/libMoltenVK.dylib" ]; then
-            cp "$MOLTENVK_DIR/lib/libMoltenVK.dylib" "$APP/Contents/Frameworks/"
+          echo "Found .app bundle at: $APP_BUNDLE_PATH"
+          QT_MACOS_ROOT=$(find build/externals/qt -maxdepth 3 -type d -path "*/macos" | sort -V | tail -n 1)
+          if [ -z "$QT_MACOS_ROOT" ]; then
+            echo "::error::Could not find Qt macOS root under build/externals/qt"; exit 1
           fi
-
-          # Copy missing dylibs (from citron-neo/CI approach, iterative)
+          MACDEPLOYQT_PATH="$QT_MACOS_ROOT/bin/macdeployqt"
+          if [ ! -f "$MACDEPLOYQT_PATH" ]; then MACDEPLOYQT_PATH="$QT_MACOS_ROOT/bin/macdeployqt6"; fi
+          QT_LIB_PATH="$QT_MACOS_ROOT/lib"
+          if [ ! -f "$MACDEPLOYQT_PATH" ]; then
+            echo "::error::Could not find macdeployqt or macdeployqt6 in $QT_MACOS_ROOT/bin"; exit 1
+          fi
+          "$MACDEPLOYQT_PATH" "$APP_BUNDLE_PATH" -libpath="$QT_LIB_PATH" -verbose=1 -always-overwrite
+          FRAMEWORKS_PATH="$APP_BUNDLE_PATH/Contents/Frameworks"
+          VULKAN_ICD_DIR="$APP_BUNDLE_PATH/Contents/Resources/vulkan/icd.d"
+          mkdir -p "$VULKAN_ICD_DIR"
+          cat > "$VULKAN_ICD_DIR/MoltenVK_icd.json" << 'ICDEOF'
+          {
+              "file_format_version": "1.0.0",
+              "ICD": {
+                  "library_path": "../../../Frameworks/libMoltenVK.dylib",
+                  "api_version": "1.4.0",
+                  "is_portability_driver": true
+              }
+          }
+          ICDEOF
           copy_missing_deps() {
-            for lib in $(find "$APP" \( -name "citron" -o -name "*.dylib" \)); do
-              for dep in $(otool -L "$lib" 2>/dev/null | awk '/^\t\// && /(Homebrew|usr\/local)/ {print $1}'); do
-                depname=$(basename "$dep")
-                dest="$APP/Contents/Frameworks/$depname"
-                if [ ! -f "$dest" ]; then
-                  echo "  copying $depname"
-                  cp "$dep" "$dest" 2>/dev/null || true
-                  chmod u+w "$dest" 2>/dev/null || true
+            find "$FRAMEWORKS_PATH" -name "*.dylib" -type f | while read -r dylib; do
+              otool -L "$dylib" 2>/dev/null | grep -E "^\s+@rpath/" | awk '{print $1}' | sed 's|@rpath/||' | while read -r dep; do
+                if [ ! -f "$FRAMEWORKS_PATH/$dep" ]; then
+                  HOMEBREW_LIB=$(find /opt/homebrew/lib /opt/homebrew/Cellar /usr/local/lib -name "$dep" 2>/dev/null | head -1)
+                  if [ -n "$HOMEBREW_LIB" ] && [ -f "$HOMEBREW_LIB" ]; then
+                    cp "$HOMEBREW_LIB" "$FRAMEWORKS_PATH/"
+                    chmod u+w "$FRAMEWORKS_PATH/$dep"
+                    install_name_tool -id "@rpath/$dep" "$FRAMEWORKS_PATH/$dep" 2>/dev/null || true
+                  fi
+                fi
+              done
+              otool -L "$dylib" 2>/dev/null | grep -E "^\s+(/opt/homebrew|/usr/local)" | awk '{print $1}' | while read -r abs_dep; do
+                dep_name=$(basename "$abs_dep")
+                if [ ! -f "$FRAMEWORKS_PATH/$dep_name" ] && [ -f "$abs_dep" ]; then
+                  cp "$abs_dep" "$FRAMEWORKS_PATH/"
+                  chmod u+w "$FRAMEWORKS_PATH/$dep_name"
+                  install_name_tool -id "@rpath/$dep_name" "$FRAMEWORKS_PATH/$dep_name" 2>/dev/null || true
                 fi
               done
             done
           }
-
-          for i in $(seq 1 5); do
-            echo "Dependency pass $i..."
-            copy_missing_deps
+          for i in 1 2 3 4 5; do copy_missing_deps; done
+          EXECUTABLE_PATH="$APP_BUNDLE_PATH/Contents/MacOS/citron"
+          install_name_tool -add_rpath "@executable_path/../Frameworks" "$EXECUTABLE_PATH" 2>/dev/null || true
+          otool -l "$EXECUTABLE_PATH" | grep -A2 LC_RPATH | grep "path " | awk '{print $2}' | while read -r rpath; do
+            case "$rpath" in
+              @executable_path*|@loader_path*|@rpath*) ;;
+              *) install_name_tool -delete_rpath "$rpath" "$EXECUTABLE_PATH" 2>/dev/null || true ;;
+            esac
           done
-
-          # Fix rpaths
-          for lib in $(find "$APP/Contents/Frameworks" -name "*.dylib" 2>/dev/null); do
-            install_name_tool -add_rpath "@loader_path/" "$lib" 2>/dev/null || true
+          find "$FRAMEWORKS_PATH" -name "*.dylib" -type f | while read -r dylib; do
+            dylib_name=$(basename "$dylib")
+            install_name_tool -id "@rpath/$dylib_name" "$dylib" 2>/dev/null || true
+            otool -L "$dylib" 2>/dev/null | grep -E "^\s+/" | awk '{print $1}' | while read -r dep; do
+              dep_name=$(basename "$dep")
+              if [ -f "$FRAMEWORKS_PATH/$dep_name" ]; then
+                install_name_tool -change "$dep" "@rpath/$dep_name" "$dylib" 2>/dev/null || true
+              fi
+            done
+            otool -l "$dylib" 2>/dev/null | grep -A2 LC_RPATH | grep "path " | awk '{print $2}' | while read -r rpath; do
+              case "$rpath" in
+                @executable_path*|@loader_path*|@rpath*) ;;
+                *) install_name_tool -delete_rpath "$rpath" "$dylib" 2>/dev/null || true ;;
+              esac
+            done
+            install_name_tool -add_rpath "@loader_path" "$dylib" 2>/dev/null || true
           done
-          install_name_tool -add_rpath "@executable_path/../Frameworks" "$APP/Contents/MacOS/citron" 2>/dev/null || true
+          otool -L "$EXECUTABLE_PATH" 2>/dev/null | grep -E "^\s+/" | awk '{print $1}' | while read -r dep; do
+            dep_name=$(basename "$dep")
+            if [ -f "$FRAMEWORKS_PATH/$dep_name" ]; then
+              install_name_tool -change "$dep" "@rpath/$dep_name" "$EXECUTABLE_PATH" 2>/dev/null || true
+            fi
+          done
+          find "$FRAMEWORKS_PATH" -name "*.framework" -type d | while read -r framework_dir; do
+            framework_name=$(basename "$framework_dir" .framework)
+            framework_binary="$framework_dir/Versions/A/$framework_name"
+            [ ! -f "$framework_binary" ] && framework_binary="$framework_dir/$framework_name"
+            [ -f "$framework_binary" ] && install_name_tool -id "@rpath/$framework_name.framework/Versions/A/$framework_name" "$framework_binary" 2>/dev/null || true
+          done
+          chmod -R u+w "$APP_BUNDLE_PATH"
+          codesign --force --deep -s - "$APP_BUNDLE_PATH"
+          DMG_FILENAME="Citron-macOS-${{ steps.version.outputs.VERSION }}.dmg"
+          hdiutil create -fs HFS+ -srcfolder "$APP_BUNDLE_PATH" -volname "Citron Nightly" "./$DMG_FILENAME"
+          mv "$DMG_FILENAME" ./dist/
 
-          # Ad-hoc codesign
-          codesign --force --deep -s - "$APP" 2>/dev/null || true
-
-          # DMG
-          VERSION=$(git describe --tags --always 2>/dev/null || git rev-parse --short HEAD)
-          DMG="dist/Citron-macOS-${VERSION}.dmg"
-          hdiutil create -volname "Citron" -srcfolder "$APP" -ov -format UDZO "$DMG"
-          echo "DMG ready: $(ls -lh "$DMG")"
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v5
+      - name: Upload macOS Build
+        uses: actions/upload-artifact@v4
         with:
           name: Citron-macOS
-          path: dist/*.dmg
-          if-no-files-found: error
+          path: "dist/*.dmg"
+
+  # ============================================================================
+  # Windows (Clangtron cross-compile)
+  # ============================================================================
+  build-windows:
+    name: "Citron Build (Windows Clangtron)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    env:
+      CPM_SOURCE_CACHE: /home/runner/.cache/cpm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Cache CPM and toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            /home/runner/.cache/cpm
+            llvm-mingw
+          key: clangtron-${{ hashFiles('externals/dynarmic/dependencies.cmake', 'build-clangtron-windows.sh') }}
+
+      - name: Get Version
+        id: version
+        run: |
+          VERSION=$(git rev-parse --short HEAD)
+          echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Skip BOLT
+        run: |
+          mkdir -p /tmp/fake-bolt
+          echo '#!/bin/bash' > /tmp/fake-bolt/llvm-bolt-21
+          echo 'exit 0' >> /tmp/fake-bolt/llvm-bolt-21
+          chmod +x /tmp/fake-bolt/llvm-bolt-21
+          echo '#!/bin/bash' > /tmp/fake-bolt/merge-fdata-21
+          echo 'exit 0' >> /tmp/fake-bolt/merge-fdata-21
+          chmod +x /tmp/fake-bolt/merge-fdata-21
+          echo "/tmp/fake-bolt" >> $GITHUB_PATH
+
+      - name: Setup Clangtron Build Environment
+        run: |
+          chmod +x build-clangtron-windows.sh
+          ./build-clangtron-windows.sh setup
+          echo "$PWD/llvm-mingw/bin" >> $GITHUB_PATH
+
+      - name: Build Citron
+        run: |
+          export PATH="$PWD/llvm-mingw/bin:$PATH"
+          export CITRON_BUILD_TYPE=Nightly
+          ./build-clangtron-windows.sh use --pgo none --lto full
+
+      - name: Package Windows Build
+        run: |
+          mkdir -p dist
+          BUILD_DIR=$(find build -maxdepth 1 -type d -name "use-*" | head -1)
+          if [ -z "$BUILD_DIR" ]; then
+            BUILD_DIR="build"
+          fi
+          BIN_SRC="$BUILD_DIR/bin"
+          if [ ! -d "$BIN_SRC" ]; then
+            echo "::error::Could not find build output directory"; exit 1
+          fi
+          ZIP_NAME="Citron-Windows-${{ steps.version.outputs.VERSION }}-x64-clangtron.zip"
+          cd "$BIN_SRC" && zip -r "../../../dist/$ZIP_NAME" . && cd ../../..
+          echo "Created $ZIP_NAME"
+
+      - name: Upload Windows Build
+        uses: actions/upload-artifact@v4
+        with:
+          name: Citron-Windows
+          path: "dist/*.zip"
