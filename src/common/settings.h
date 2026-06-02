@@ -689,7 +689,7 @@ struct Values {
     SwitchableSetting<bool> motion_enabled{linkage, true, "motion_enabled", Category::Controls};
     Setting<std::string> udp_input_servers{linkage, "127.0.0.1:26760", "udp_input_servers",
                                            Category::Controls};
-    Setting<bool> enable_udp_controller{linkage, false, "enable_udp_controller",
+    Setting<bool> enable_udp_controller{linkage, true, "enable_udp_controller",
                                         Category::Controls};
 
     Setting<bool> pause_tas_on_load{linkage, true, "pause_tas_on_load", Category::Controls};

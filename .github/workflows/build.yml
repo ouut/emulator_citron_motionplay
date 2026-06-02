@@ -1,0 +1,124 @@
+name: Build Citron
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ============================================================================
+  # macOS Build
+  # ============================================================================
+  build-macos:
+    runs-on: macos-latest
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          brew install \
+            ninja boost catch2 cmake enet fmt ffmpeg glslang \
+            lz4 zstd openssl@3 libusb opus pkg-config \
+            nlohmann-json sdl2 openal-soft qt@6 \
+            molten-vk vulkan-headers vulkan-loader
+
+      - name: Configure CMake
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 \
+            -DENABLE_QT=ON \
+            -DENABLE_SDL2=ON \
+            -DENABLE_WEB_SERVICE=OFF \
+            -DCITRON_ENABLE_LTO=OFF \
+            -DCITRON_USE_BUNDLED_VCPKG=OFF \
+            -DCITRON_USE_BUNDLED_FFMPEG=OFF \
+            -DUSE_DISCORD_PRESENCE=OFF \
+            -DCITRON_TESTS=OFF
+
+      - name: Build
+        run: cmake --build build --config Release --parallel $(sysctl -n hw.logicalcpu)
+
+      - name: Package
+        run: |
+          # Create app bundle
+          mkdir -p dist
+          if [ -d "build/bin/citron.app" ]; then
+            cp -r build/bin/citron.app dist/
+            # Run macdeployqt
+            if command -v macdeployqt6 &> /dev/null; then
+              macdeployqt6 dist/citron.app -verbose=1
+            elif command -v macdeployqt &> /dev/null; then
+              macdeployqt dist/citron.app -verbose=1
+            fi
+            # Create DMG
+            VERSION=$(git rev-parse --short HEAD)
+            hdiutil create -volname "Citron" -srcfolder dist/citron.app \
+              -ov -format UDZO "dist/Citron-macOS-${VERSION}.dmg"
+            ls -la dist/
+          else
+            echo "citron.app not found, checking build output..."
+            find build -name "citron*" -type f 2>/dev/null || echo "No citron binary found"
+            find build -name "*.app" 2>/dev/null || echo "No .app bundle found"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: Citron-macOS
+          path: dist/*.dmg
+          if-no-files-found: ignore
+
+  # ============================================================================
+  # Windows Build (Clangtron cross-compile)
+  # ============================================================================
+  build-windows:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Clangtron
+        run: |
+          chmod +x build-clangtron-windows.sh
+          ./build-clangtron-windows.sh setup
+
+      - name: Build
+        run: |
+          export PATH="$PWD/llvm-mingw/bin:$PATH"
+          ./build-clangtron-windows.sh use --pgo none --lto full
+
+      - name: Package
+        run: |
+          VERSION=$(git rev-parse --short HEAD)
+          mkdir -p dist
+          if [ -d "build/use-nopgo/bin" ]; then
+            cd build/use-nopgo/bin
+            zip -r "../../../dist/Citron-Windows-${VERSION}.zip" *.exe *.dll
+            cd ../../..
+          elif [ -d "build/bin" ]; then
+            cd build/bin
+            zip -r "../../dist/Citron-Windows-${VERSION}.zip" *.exe *.dll
+            cd ../..
+          fi
+          ls -la dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: Citron-Windows
+          path: dist/*.zip
+          if-no-files-found: ignore
