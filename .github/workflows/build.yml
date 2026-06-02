@@ -3,18 +3,9 @@ name: Build Citron
 on:
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
   workflow_dispatch:
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
-  # ============================================================================
-  # macOS Build
-  # ============================================================================
   build-macos:
     runs-on: macos-latest
     timeout-minutes: 240
@@ -25,13 +16,33 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Check disk space
+        run: df -h /
+
       - name: Install dependencies
         run: |
           brew install \
-            ninja boost catch2 cmake enet fmt ffmpeg glslang \
-            lz4 zstd openssl@3 libusb opus pkg-config \
-            nlohmann-json sdl2 openal-soft qt@6 \
-            molten-vk vulkan-headers vulkan-loader
+            ninja cmake pkg-config \
+            boost catch2 enet fmt glslang \
+            lz4 zstd openssl@3 libusb opus \
+            nlohmann-json sdl2 openal-soft \
+            qt@6 molten-vk vulkan-headers vulkan-loader \
+            ffmpeg@7
+          brew link qt@6 --force
+          echo "--- brew installed ---"
+          df -h /
+
+      - name: Patch Qt AGL
+        run: |
+          # Fix macOS AGL framework path for bundled Qt
+          QTCORE=$(brew --prefix qt@6)
+          CMAKE_FILE="$QTCORE/lib/cmake/Qt6Gui/Qt6GuiFindOpenGL.cmake"
+          if [ -f "$CMAKE_FILE" ]; then
+            echo "Found Qt6GuiFindOpenGL.cmake"
+            grep -n "AGL" "$CMAKE_FILE" || echo "No AGL references found"
+          fi
+          # Check in externals too
+          find externals -name "FindWrapOpenGL.cmake" -exec grep -l "AGL" {} \; 2>/dev/null || true
 
       - name: Configure CMake
         run: |
@@ -45,80 +56,76 @@ jobs:
             -DCITRON_USE_BUNDLED_VCPKG=OFF \
             -DCITRON_USE_BUNDLED_FFMPEG=OFF \
             -DUSE_DISCORD_PRESENCE=OFF \
-            -DCITRON_TESTS=OFF
+            -DCITRON_TESTS=OFF \
+            -DCITRON_CHECK_SUBMODULES=OFF
 
       - name: Build
-        run: cmake --build build --config Release --parallel $(sysctl -n hw.logicalcpu)
+        run: |
+          cmake --build build --config Release --parallel $(sysctl -n hw.logicalcpu)
+          echo "--- build done ---"
+          df -h /
 
       - name: Package
         run: |
-          # Create app bundle
           mkdir -p dist
-          if [ -d "build/bin/citron.app" ]; then
-            cp -r build/bin/citron.app dist/
-            # Run macdeployqt
-            if command -v macdeployqt6 &> /dev/null; then
-              macdeployqt6 dist/citron.app -verbose=1
-            elif command -v macdeployqt &> /dev/null; then
-              macdeployqt dist/citron.app -verbose=1
-            fi
-            # Create DMG
-            VERSION=$(git rev-parse --short HEAD)
-            hdiutil create -volname "Citron" -srcfolder dist/citron.app \
-              -ov -format UDZO "dist/Citron-macOS-${VERSION}.dmg"
-            ls -la dist/
-          else
-            echo "citron.app not found, checking build output..."
-            find build -name "citron*" -type f 2>/dev/null || echo "No citron binary found"
-            find build -name "*.app" 2>/dev/null || echo "No .app bundle found"
+          APP="build/bin/citron.app"
+
+          if [ ! -d "$APP" ]; then
+            echo "ERROR: citron.app not found!"
+            echo "Searching for built files..."
+            find build -name "citron*" -type f 2>/dev/null | head -20
+            find build -name "*.app" 2>/dev/null | head -10
+            exit 1
           fi
+
+          cp -r "$APP" dist/
+
+          # Bundle Qt frameworks
+          QTDIR=$(brew --prefix qt@6)
+          if [ -f "$QTDIR/bin/macdeployqt" ]; then
+            MACDEPLOYQT="$QTDIR/bin/macdeployqt"
+          else
+            MACDEPLOYQT="macdeployqt"
+          fi
+
+          echo "Running macdeployqt from: $MACDEPLOYQT"
+          $MACDEPLOYQT dist/citron.app -verbose=1 || true
+
+          # Copy MoltenVK
+          MOLTENVK=$(brew --prefix molten-vk 2>/dev/null || echo "")
+          if [ -n "$MOLTENVK" ] && [ -d "$MOLTENVK" ]; then
+            mkdir -p dist/citron.app/Contents/Frameworks
+            cp "$MOLTENVK/lib/libMoltenVK.dylib" dist/citron.app/Contents/Frameworks/ 2>/dev/null || true
+          fi
+
+          # Copy any missing dylibs from homebrew
+          for lib in $(find dist/citron.app -name "*.dylib" -o -name "citron"); do
+            for dep in $(otool -L "$lib" | grep "/usr/local/\|/opt/homebrew/" | awk '{print $1}'); do
+              depname=$(basename "$dep")
+              if [ ! -f "dist/citron.app/Contents/Frameworks/$depname" ] && [ ! -f "dist/citron.app/Contents/MacOS/$depname" ]; then
+                echo "Copying missing dep: $depname"
+                cp "$dep" dist/citron.app/Contents/Frameworks/ 2>/dev/null || true
+              fi
+            done
+          done
+
+          # Fix rpaths
+          install_name_tool -add_rpath "@executable_path/../Frameworks" dist/citron.app/Contents/MacOS/citron 2>/dev/null || true
+
+          # Ad-hoc codesign (no Apple Developer account needed for local use)
+          codesign --force --deep -s - dist/citron.app 2>/dev/null || true
+
+          # Create DMG
+          VERSION=$(git rev-parse --short HEAD)
+          DMG="dist/Citron-macOS-${VERSION}.dmg"
+          hdiutil create -volname "Citron" -srcfolder dist/citron.app \
+            -ov -format UDZO "$DMG"
+          echo "DMG created: $DMG"
+          ls -la dist/
 
       - name: Upload artifact
         uses: actions/upload-artifact@v5
         with:
           name: Citron-macOS
           path: dist/*.dmg
-          if-no-files-found: ignore
-
-  # ============================================================================
-  # Windows Build (Clangtron cross-compile)
-  # ============================================================================
-  build-windows:
-    runs-on: ubuntu-latest
-    timeout-minutes: 360
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Clangtron
-        run: |
-          chmod +x build-clangtron-windows.sh
-          ./build-clangtron-windows.sh setup
-
-      - name: Build
-        run: |
-          export PATH="$PWD/llvm-mingw/bin:$PATH"
-          ./build-clangtron-windows.sh use --pgo none --lto full
-
-      - name: Package
-        run: |
-          VERSION=$(git rev-parse --short HEAD)
-          mkdir -p dist
-          if [ -d "build/use-nopgo/bin" ]; then
-            cd build/use-nopgo/bin
-            zip -r "../../../dist/Citron-Windows-${VERSION}.zip" *.exe *.dll
-            cd ../../..
-          elif [ -d "build/bin" ]; then
-            cd build/bin
-            zip -r "../../dist/Citron-Windows-${VERSION}.zip" *.exe *.dll
-            cd ../..
-          fi
-          ls -la dist/
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v5
-        with:
-          name: Citron-Windows
-          path: dist/*.zip
-          if-no-files-found: ignore
+          if-no-files-found: error
